@@ -1,5 +1,2 @@
 fastapi
-uvicorn
-numpy
-pandas
-scipy
+uvicorn[standard]
