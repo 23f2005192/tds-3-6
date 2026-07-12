@@ -1,6 +1,5 @@
 fastapi
 uvicorn
-librosa
 numpy
 pandas
 scipy
