@@ -1,133 +1,95 @@
-import base64
-import os
-import tempfile
-import numpy as np
-import pandas as pd
-from scipy import stats
-from scipy.io import wavfile
-from fastapi import FastAPI, HTTPException
+import re
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import uvicorn
-import time
 
 app = FastAPI()
 
-# In-memory cache: audio_id -> computed statistics dict
-CACHE = {}
+# CORS enabled for all origins so a Cloudflare Worker (or any grader) can call this.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-class AudioRequest(BaseModel):
-    audio_id: str
-    audio_base64: str
+class ExtractRequest(BaseModel):
+    invoice_text: str
 
-def decode_audio(audio_base64: str) -> str:
-    audio_bytes = base64.b64decode(audio_base64)
-    temp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
-    temp.write(audio_bytes)
-    temp.close()
-    return temp.name
+MONTHS = {
+    "jan": 1, "january": 1, "feb": 2, "february": 2, "mar": 3, "march": 3,
+    "apr": 4, "april": 4, "may": 5, "jun": 6, "june": 6, "jul": 7, "july": 7,
+    "aug": 8, "august": 8, "sep": 9, "sept": 9, "september": 9,
+    "oct": 10, "october": 10, "nov": 11, "november": 11, "dec": 12, "december": 12,
+}
 
-def compute_stats_from_wav(file_path: str) -> dict:
-    # Read WAV file (fast)
-    sr, y = wavfile.read(file_path)
-    # Convert to float for calculations
-    y = y.astype(np.float32) / np.iinfo(y.dtype).max
-
-    duration = len(y) / sr
-    frame_len = 2048
-    num_frames = len(y) // frame_len
-    if num_frames == 0:
-        num_frames = 1
-        frame_len = len(y)
-
-    # Pre-allocate arrays
-    rms_vals = np.zeros(num_frames, dtype=np.float32)
-    zcr_vals = np.zeros(num_frames, dtype=np.float32)
-
-    for i in range(num_frames):
-        start = i * frame_len
-        end = start + frame_len
-        frame = y[start:end]
-        # RMS
-        rms_vals[i] = np.sqrt(np.mean(frame ** 2))
-        # Zero-crossing rate
-        sign_changes = np.sum(np.abs(np.diff(np.sign(frame)))) / 2
-        zcr_vals[i] = sign_changes / len(frame)
-
-    # Build DataFrame: one row per frame
-    df = pd.DataFrame({
-        "duration": np.full(num_frames, duration),
-        "rms": rms_vals,
-        "zcr": zcr_vals
-    })
-
-    # If audio is completely silent, RMS may be zero – that's fine.
-
-    # Initialize the exact required response
-    result = {
-        "rows": len(df),
-        "columns": list(df.columns),
-        "mean": {},
-        "std": {},
-        "variance": {},
-        "min": {},
-        "max": {},
-        "median": {},
-        "mode": {},
-        "range": {},
-        "allowed_values": {},
-        "value_range": {},
-        "correlation": []
-    }
-
-    for col in df.columns:
-        data = df[col].values
-        # Mode (uses scipy; for continuous data we fall back to median or first value)
-        if len(data) > 0:
-            mode_val = float(stats.mode(data)[0][0])
-        else:
-            mode_val = 0.0
-
-        result["mean"][col] = float(np.mean(data))
-        result["std"][col] = float(np.std(data, ddof=1) if len(data) > 1 else 0.0)
-        result["variance"][col] = float(np.var(data, ddof=1) if len(data) > 1 else 0.0)
-        result["min"][col] = float(np.min(data))
-        result["max"][col] = float(np.max(data))
-        result["median"][col] = float(np.median(data))
-        result["mode"][col] = mode_val
-        result["range"][col] = float(np.max(data) - np.min(data))
-        # Allowed values: unique sorted (float)
-        result["allowed_values"][col] = sorted([float(v) for v in set(data)])
-        result["value_range"][col] = [float(np.min(data)), float(np.max(data))]
-
-    # Correlation matrix
-    if len(df.columns) > 1:
-        result["correlation"] = df.corr().values.tolist()
-    else:
-        result["correlation"] = []
-
-    return result
-
-@app.post("/")
-async def process_audio(request: AudioRequest):
-    # Check cache first
-    if request.audio_id in CACHE:
-        return CACHE[request.audio_id]
-
+def parse_amount(s):
+    if s is None:
+        return None
+    s = s.replace(",", "").strip()
     try:
-        temp_path = decode_audio(request.audio_base64)
-        stats_response = compute_stats_from_wav(temp_path)
-        os.unlink(temp_path)
+        return round(float(s), 2)
+    except ValueError:
+        return None
 
-        # Store in cache
-        CACHE[request.audio_id] = stats_response
-        return stats_response
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+def find_invoice_no(text):
+    m = re.search(r"(?:Invoice\s*No|Ref)\s*[:\-]?\s*([A-Za-z0-9/\-]+)", text, re.IGNORECASE)
+    return m.group(1).strip() if m else None
 
-@app.get("/")
-async def health_check():
-    return {"status": "healthy", "features": "duration, rms, zcr", "cached": len(CACHE)}
+def find_date(text):
+    m = re.search(r"\b(\d{4})-(\d{2})-(\d{2})\b", text)
+    if m:
+        return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+    m = re.search(r"\b(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})\b", text)
+    if m:
+        day, mon_name, year = m.groups()
+        mon = MONTHS.get(mon_name.lower())
+        if mon:
+            return f"{int(year):04d}-{mon:02d}-{int(day):02d}"
+    m = re.search(r"\b([A-Za-z]+)\s+(\d{1,2}),?\s+(\d{4})\b", text)
+    if m:
+        mon_name, day, year = m.groups()
+        mon = MONTHS.get(mon_name.lower())
+        if mon:
+            return f"{int(year):04d}-{mon:02d}-{int(day):02d}"
+    return None
 
-if __name__ == "__main__":
-    port = int(os.getenv("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+def find_vendor(text):
+    m = re.search(r"Vendor\s*[:\-]\s*(.+)", text, re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    first_line = text.strip().splitlines()[0]
+    m2 = re.match(r"(.+?)\s*[—\-]\s*(Tax Invoice|Invoice)", first_line, re.IGNORECASE)
+    if m2:
+        return m2.group(1).strip()
+    return None
+
+def find_subtotal(text):
+    m = re.search(r"Subtotal\s*[.:\-]*\s*Rs\.?\s*([\d,]+\.\d{2})", text, re.IGNORECASE)
+    return parse_amount(m.group(1)) if m else None
+
+def find_tax(text):
+    m = re.search(r"(?:GST|IGST|CGST|SGST|Tax)\s*\(?\d*%?\)?\s*[.:\-]*\s*Rs\.?\s*([\d,]+\.\d{2})", text, re.IGNORECASE)
+    return parse_amount(m.group(1)) if m else None
+
+def find_currency(text):
+    m = re.search(r"Currency\s*[:\-]\s*([A-Za-z]{3})", text, re.IGNORECASE)
+    if m:
+        return m.group(1).upper()
+    if re.search(r"\bRs\.?\b|₹|INR", text):
+        return "INR"
+    if re.search(r"\$|USD", text):
+        return "USD"
+    return None
+
+@app.post("/extract")
+def extract(req: ExtractRequest):
+    text = req.invoice_text
+    return {
+        "invoice_no": find_invoice_no(text),
+        "date": find_date(text),
+        "vendor": find_vendor(text),
+        "amount": find_subtotal(text),
+        "tax": find_tax(text),
+        "currency": find_currency(text),
+    }
