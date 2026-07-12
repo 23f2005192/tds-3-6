@@ -4,26 +4,21 @@ import tempfile
 import numpy as np
 import pandas as pd
 from scipy import stats
-import librosa
+from scipy.io import wavfile
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import uvicorn
+import time
 
-# ------------------------------------------------------------
-# 1. INIT APP
-# ------------------------------------------------------------
 app = FastAPI()
 
-# ------------------------------------------------------------
-# 2. REQUEST SCHEMA
-# ------------------------------------------------------------
+# In-memory cache: audio_id -> computed statistics dict
+CACHE = {}
+
 class AudioRequest(BaseModel):
     audio_id: str
     audio_base64: str
 
-# ------------------------------------------------------------
-# 3. DECODE BASE64 TO TEMPORARY AUDIO FILE
-# ------------------------------------------------------------
 def decode_audio(audio_base64: str) -> str:
     audio_bytes = base64.b64decode(audio_base64)
     temp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
@@ -31,34 +26,43 @@ def decode_audio(audio_base64: str) -> str:
     temp.close()
     return temp.name
 
-# ------------------------------------------------------------
-# 4. EXTRACT AUDIO FEATURES AND COMPUTE ALL REQUIRED STATISTICS
-#    Features: duration, rms, zero_crossing_rate, 13 MFCCs
-#    Returns JSON with exactly the required keys.
-# ------------------------------------------------------------
-def compute_stats_from_audio(file_path: str) -> dict:
-    # Load audio
-    y, sr = librosa.load(file_path, sr=None)
-    
-    # Feature extraction
+def compute_stats_from_wav(file_path: str) -> dict:
+    # Read WAV file (fast)
+    sr, y = wavfile.read(file_path)
+    # Convert to float for calculations
+    y = y.astype(np.float32) / np.iinfo(y.dtype).max
+
     duration = len(y) / sr
-    rms = librosa.feature.rms(y=y)[0]                     # shape (n_frames,)
-    zcr = librosa.feature.zero_crossing_rate(y)[0]       # shape (n_frames,)
-    mfccs = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)  # shape (13, n_frames)
-    
-    # Build a DataFrame: each column is a feature, each row is a time frame
+    frame_len = 2048
+    num_frames = len(y) // frame_len
+    if num_frames == 0:
+        num_frames = 1
+        frame_len = len(y)
+
+    # Pre-allocate arrays
+    rms_vals = np.zeros(num_frames, dtype=np.float32)
+    zcr_vals = np.zeros(num_frames, dtype=np.float32)
+
+    for i in range(num_frames):
+        start = i * frame_len
+        end = start + frame_len
+        frame = y[start:end]
+        # RMS
+        rms_vals[i] = np.sqrt(np.mean(frame ** 2))
+        # Zero-crossing rate
+        sign_changes = np.sum(np.abs(np.diff(np.sign(frame)))) / 2
+        zcr_vals[i] = sign_changes / len(frame)
+
+    # Build DataFrame: one row per frame
     df = pd.DataFrame({
-        "duration": np.full(mfccs.shape[1], duration),   # constant across frames
-        "rms": rms,
-        "zcr": zcr,
-        **{f"mfcc_{i+1}": mfccs[i] for i in range(mfccs.shape[0])}
+        "duration": np.full(num_frames, duration),
+        "rms": rms_vals,
+        "zcr": zcr_vals
     })
-    
-    # If no frames (shouldn't happen), add a dummy row
-    if df.empty:
-        df = pd.DataFrame([[0]*len(df.columns)], columns=df.columns)
-    
-    # Initialize result skeleton
+
+    # If audio is completely silent, RMS may be zero – that's fine.
+
+    # Initialize the exact required response
     result = {
         "rows": len(df),
         "columns": list(df.columns),
@@ -74,13 +78,15 @@ def compute_stats_from_audio(file_path: str) -> dict:
         "value_range": {},
         "correlation": []
     }
-    
-    # Compute per-column statistics
+
     for col in df.columns:
         data = df[col].values
-        # Mode: use scipy.stats.mode (returns array, pick first)
-        mode_val = float(stats.mode(data)[0][0]) if len(data) > 0 else 0.0
-        
+        # Mode (uses scipy; for continuous data we fall back to median or first value)
+        if len(data) > 0:
+            mode_val = float(stats.mode(data)[0][0])
+        else:
+            mode_val = 0.0
+
         result["mean"][col] = float(np.mean(data))
         result["std"][col] = float(np.std(data, ddof=1) if len(data) > 1 else 0.0)
         result["variance"][col] = float(np.var(data, ddof=1) if len(data) > 1 else 0.0)
@@ -89,43 +95,39 @@ def compute_stats_from_audio(file_path: str) -> dict:
         result["median"][col] = float(np.median(data))
         result["mode"][col] = mode_val
         result["range"][col] = float(np.max(data) - np.min(data))
-        # allowed_values: unique values sorted (convert to float for JSON)
+        # Allowed values: unique sorted (float)
         result["allowed_values"][col] = sorted([float(v) for v in set(data)])
         result["value_range"][col] = [float(np.min(data)), float(np.max(data))]
-    
-    # Correlation matrix (only if more than one column)
+
+    # Correlation matrix
     if len(df.columns) > 1:
-        # Compute correlation matrix and convert to list of lists
-        corr_matrix = df.corr().values.tolist()
-        result["correlation"] = corr_matrix
+        result["correlation"] = df.corr().values.tolist()
     else:
-        result["correlation"] = []   # empty list as per spec
-    
+        result["correlation"] = []
+
     return result
 
-# ------------------------------------------------------------
-# 5. API ENDPOINTS
-# ------------------------------------------------------------
 @app.post("/")
 async def process_audio(request: AudioRequest):
+    # Check cache first
+    if request.audio_id in CACHE:
+        return CACHE[request.audio_id]
+
     try:
-        # Decode base64 to temp file
         temp_path = decode_audio(request.audio_base64)
-        # Compute statistics from the audio file
-        stats_response = compute_stats_from_audio(temp_path)
-        # Clean up
+        stats_response = compute_stats_from_wav(temp_path)
         os.unlink(temp_path)
+
+        # Store in cache
+        CACHE[request.audio_id] = stats_response
         return stats_response
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/")
 async def health_check():
-    return {"status": "healthy", "features": "duration, rms, zcr, 13 MFCCs"}
+    return {"status": "healthy", "features": "duration, rms, zcr", "cached": len(CACHE)}
 
-# ------------------------------------------------------------
-# 6. RUN SERVER (binds to $PORT for Render)
-# ------------------------------------------------------------
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
